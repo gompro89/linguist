@@ -3,15 +3,27 @@ require_relative "./helper"
 class TestFileBlob < Minitest::Test
   include Linguist
 
+  def silence_warnings
+    original_verbosity = $VERBOSE
+    $VERBOSE = nil
+    yield
+  ensure
+    $VERBOSE = original_verbosity
+  end
+
   def setup
-    # git blobs are normally loaded as ASCII-8BIT since they may contain data
-    # with arbitrary encoding not known ahead of time
-    @original_external = Encoding.default_external
-    Encoding.default_external = Encoding.find("ASCII-8BIT")
+    silence_warnings do
+      # git blobs are normally loaded as ASCII-8BIT since they may contain data
+      # with arbitrary encoding not known ahead of time
+      @original_external = Encoding.default_external
+      Encoding.default_external = Encoding.find("ASCII-8BIT")
+    end
   end
 
   def teardown
-    Encoding.default_external = @original_external
+    silence_warnings do
+      Encoding.default_external = @original_external
+    end
   end
 
   def script_blob(name)
@@ -176,6 +188,17 @@ class TestFileBlob < Minitest::Test
     assert fixture_blob("Binary/MainMenu.nib").generated?
     assert !sample_blob("XML/project.pbxproj").generated?
 
+    # Cocoapods
+    assert sample_blob('Pods/blah').generated?
+    assert !sample_blob('My-Pods/blah').generated?
+
+    # Carthage
+    assert sample_blob('Carthage/Build/blah').generated?
+    assert !sample_blob('Carthage/blah').generated?
+    assert !sample_blob('Carthage/Checkout/blah').generated?
+    assert !sample_blob('My-Carthage/Build/blah').generated?
+    assert !sample_blob('My-Carthage/Build/blah').generated?
+
     # Gemfile.lock is NOT generated
     assert !sample_blob("Gemfile.lock").generated?
 
@@ -282,6 +305,8 @@ class TestFileBlob < Minitest::Test
     assert !sample_blob("Godeps/Godeps.json").vendored?
     assert sample_blob("Godeps/_workspace/src/github.com/kr/s3/sign.go").vendored?
 
+    assert sample_blob(".indent.pro").vendored?
+
     # Rails vendor/
     assert sample_blob("vendor/plugins/will_paginate/lib/will_paginate.rb").vendored?
 
@@ -299,13 +324,11 @@ class TestFileBlob < Minitest::Test
     assert sample_blob("deps/http_parser/http_parser.c").vendored?
     assert sample_blob("deps/v8/src/v8.h").vendored?
 
-    assert sample_blob("tools/something/else.c").vendored?
-
     # Chart.js
     assert sample_blob("some/vendored/path/Chart.js").vendored?
     assert !sample_blob("some/vendored/path/chart.js").vendored?
 
-    # Codemirror deps
+    # CodeMirror deps
     assert sample_blob("codemirror/mode/blah.js").vendored?
     assert sample_blob("codemirror/5.0/mode/blah.js").vendored?
 
@@ -476,9 +499,9 @@ class TestFileBlob < Minitest::Test
 
     # Carthage
     assert sample_blob('Carthage/blah').vendored?
-
-    # Cocoapods
-    assert sample_blob('Pods/blah').vendored?
+    assert sample_blob('iOS/Carthage/blah').vendored?
+    assert !sample_blob('My-Carthage/blah').vendored?
+    assert !sample_blob('iOS/My-Carthage/blah').vendored?
 
     # Html5shiv
     assert sample_blob("Scripts/html5shiv.js").vendored?
@@ -510,6 +533,14 @@ class TestFileBlob < Minitest::Test
     assert sample_blob("subproject/gradlew").vendored?
     assert sample_blob("subproject/gradlew.bat").vendored?
     assert sample_blob("subproject/gradle/wrapper/gradle-wrapper.properties").vendored?
+
+    # Maven
+    assert sample_blob("mvnw").vendored?
+    assert sample_blob("mvnw.cmd").vendored?
+    assert sample_blob(".mvn/wrapper/maven-wrapper.properties").vendored?
+    assert sample_blob("subproject/mvnw").vendored?
+    assert sample_blob("subproject/mvnw.cmd").vendored?
+    assert sample_blob("subproject/.mvn/wrapper/maven-wrapper.properties").vendored?
 
     # Octicons
     assert sample_blob("octicons.css").vendored?

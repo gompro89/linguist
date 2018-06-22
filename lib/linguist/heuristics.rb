@@ -1,6 +1,8 @@
 module Linguist
   # A collection of simple heuristics that can be used to better analyze languages.
   class Heuristics
+    HEURISTICS_CONSIDER_BYTES = 50 * 1024
+
     # Public: Use heuristics to detect language of the blob.
     #
     # blob               - An object that quacks like a blob.
@@ -14,12 +16,13 @@ module Linguist
     #
     # Returns an Array of languages, or empty if none matched or were inconclusive.
     def self.call(blob, candidates)
-      data = blob.data
+      return [] if blob.symlink?
+
+      data = blob.data[0...HEURISTICS_CONSIDER_BYTES]
 
       @heuristics.each do |heuristic|
-        if heuristic.matches?(blob.name)
-          languages = Array(heuristic.call(data))
-          return languages if languages.any? || languages.all? { |l| candidates.include?(l) }
+        if heuristic.matches?(blob.name, candidates)
+          return Array(heuristic.call(data))
         end
       end
 
@@ -28,7 +31,8 @@ module Linguist
 
     # Internal: Define a new heuristic.
     #
-    # languages - String names of languages to disambiguate.
+    # exts_and_langs - String names of file extensions and languages to
+    #                  disambiguate.
     # heuristic - Block which takes data as an argument and returns a Language or nil.
     #
     # Examples
@@ -41,23 +45,28 @@ module Linguist
     #       end
     #     end
     #
-    def self.disambiguate(*extensions, &heuristic)
-      @heuristics << new(extensions, &heuristic)
+    def self.disambiguate(*exts_and_langs, &heuristic)
+      @heuristics << new(exts_and_langs, &heuristic)
     end
 
     # Internal: Array of defined heuristics
     @heuristics = []
 
     # Internal
-    def initialize(extensions, &heuristic)
-      @extensions = extensions
+    def initialize(exts_and_langs, &heuristic)
+      @exts_and_langs, @candidates = exts_and_langs.partition {|e| e =~ /\A\./}
       @heuristic = heuristic
     end
 
-    # Internal: Check if this heuristic matches the candidate languages.
-    def matches?(filename)
+    # Internal: Check if this heuristic matches the candidate filenames or
+    # languages.
+    def matches?(filename, candidates)
       filename = filename.downcase
-      @extensions.any? { |ext| filename.end_with?(ext) }
+      candidates = candidates.compact.map(&:name)
+      @exts_and_langs.any? { |ext| filename.end_with?(ext) } ||
+        (candidates.any? &&
+         (@candidates - candidates == [] &&
+          candidates - @candidates == []))
     end
 
     # Internal: Perform the heuristic
@@ -66,7 +75,25 @@ module Linguist
     end
 
     # Common heuristics
+    CPlusPlusRegex = Regexp.union(
+        /^\s*#\s*include <(cstdint|string|vector|map|list|array|bitset|queue|stack|forward_list|unordered_map|unordered_set|(i|o|io)stream)>/,
+        /^\s*template\s*</,
+        /^[ \t]*try/,
+        /^[ \t]*catch\s*\(/,
+        /^[ \t]*(class|(using[ \t]+)?namespace)\s+\w+/,
+        /^[ \t]*(private|public|protected):$/,
+        /std::\w+/)
     ObjectiveCRegex = /^\s*(@(interface|class|protocol|property|end|synchronised|selector|implementation)\b|#import\s+.+\.h[">])/
+    Perl5Regex = /\buse\s+(?:strict\b|v?5\.)/
+    Perl6Regex = /^\s*(?:use\s+v6\b|\bmodule\b|\b(?:my\s+)?class\b)/
+
+    disambiguate ".as" do |data|
+      if /^\s*(package\s+[a-z0-9_\.]+|import\s+[a-zA-Z0-9_\.]+;|class\s+[A-Za-z0-9_]+\s+extends\s+[A-Za-z0-9_]+)/.match(data)
+        Language["ActionScript"]
+      else
+        Language["AngelScript"]
+      end
+    end
 
     disambiguate ".asc" do |data|
       if /^(----[- ]BEGIN|ssh-(rsa|dss)) /.match(data)
@@ -110,6 +137,12 @@ module Linguist
       end
     end
 
+    disambiguate ".cls" do |data|
+      if /\\\w+{/.match(data)
+        Language["TeX"]
+      end
+    end
+
     disambiguate ".cs" do |data|
       if /![\w\s]+methodsFor: /.match(data)
         Language["Smalltalk"]
@@ -119,11 +152,18 @@ module Linguist
     end
 
     disambiguate ".d" do |data|
-      if /^module /.match(data)
+      # see http://dlang.org/spec/grammar
+      # ModuleDeclaration | ImportDeclaration | FuncDeclaration | unittest
+      if /^module\s+[\w.]*\s*;|import\s+[\w\s,.:]*;|\w+\s+\w+\s*\(.*\)(?:\(.*\))?\s*{[^}]*}|unittest\s*(?:\(.*\))?\s*{[^}]*}/.match(data)
         Language["D"]
-      elsif /^((dtrace:::)?BEGIN|provider |#pragma (D (option|attributes)|ident)\s)/.match(data)
+      # see http://dtrace.org/guide/chp-prog.html, http://dtrace.org/guide/chp-profile.html, http://dtrace.org/guide/chp-opt.html
+      elsif /^(\w+:\w*:\w*:\w*|BEGIN|END|provider\s+|(tick|profile)-\w+\s+{[^}]*}|#pragma\s+D\s+(option|attributes|depends_on)\s|#pragma\s+ident\s)/.match(data)
         Language["DTrace"]
-      elsif /(\/.*:( .* \\)$| : \\$|^ : |: \\$)/.match(data)
+      # path/target : dependency \
+      # target : \
+      #  : dependency
+      # path/file.ext1 : some/path/../file.ext2
+      elsif /([\/\\].*:\s+.*\s\\$|: \\$|^ : |^[\w\s\/\\.]+\w+\.\w+\s*:\s+[\w\s\/\\.]+\w+\.\w+)/.match(data)
         Language["Makefile"]
       end
     end
@@ -144,11 +184,23 @@ module Linguist
       end
     end
 
-    disambiguate ".for", ".f" do |data|
+    fortran_rx = /^([c*][^abd-z]|      (subroutine|program|end|data)\s|\s*!)/i
+
+    disambiguate ".f" do |data|
       if /^: /.match(data)
         Language["Forth"]
-      elsif /^([c*][^abd-z]|      (subroutine|program|end)\s|\s*!)/i.match(data)
-        Language["FORTRAN"]
+      elsif data.include?("flowop")
+        Language["Filebench WML"]
+      elsif fortran_rx.match(data)
+        Language["Fortran"]
+      end
+    end
+
+    disambiguate ".for" do |data|
+      if /^: /.match(data)
+        Language["Forth"]
+      elsif fortran_rx.match(data)
+        Language["Fortran"]
       end
     end
 
@@ -181,8 +233,7 @@ module Linguist
     disambiguate ".h" do |data|
       if ObjectiveCRegex.match(data)
         Language["Objective-C"]
-      elsif (/^\s*#\s*include <(cstdint|string|vector|map|list|array|bitset|queue|stack|forward_list|unordered_map|unordered_set|(i|o|io)stream)>/.match(data) ||
-        /^\s*template\s*</.match(data) || /^[ \t]*try/.match(data) || /^[ \t]*catch\s*\(/.match(data) || /^[ \t]*(class|(using[ \t]+)?namespace)\s+\w+/.match(data) || /^[ \t]*(private|public|protected):$/.match(data) || /std::\w+/.match(data))
+      elsif CPlusPlusRegex.match(data)
         Language["C++"]
       end
     end
@@ -190,6 +241,8 @@ module Linguist
     disambiguate ".inc" do |data|
       if /^<\?(?:php)?/.match(data)
         Language["PHP"]
+      elsif /^\s*#(declare|local|macro|while)\s/.match(data)
+        Language["POV-Ray SDL"]
       end
     end
 
@@ -199,7 +252,7 @@ module Linguist
       elsif /^(%[%{}]xs|<.*>)/.match(data)
         Language["Lex"]
       elsif /^\.[a-z][a-z](\s|$)/i.match(data)
-        Language["Groff"]
+        Language["Roff"]
       elsif /^\((de|class|rel|code|data|must)\s/.match(data)
         Language["PicoLisp"]
       end
@@ -230,7 +283,7 @@ module Linguist
         Language["MUF"]
       elsif /^\s*;/.match(data)
         Language["M"]
-      elsif /^\s*\(\*/.match(data)
+      elsif /\*\)$/.match(data)
         Language["Mathematica"]
       elsif /^\s*%/.match(data)
         Language["Matlab"]
@@ -240,10 +293,12 @@ module Linguist
     end
 
     disambiguate ".md" do |data|
-      if /^[-a-z0-9=#!\*\[|]/i.match(data)
+      if /(^[-a-z0-9=#!\*\[|>])|<\//i.match(data) || data.empty?
         Language["Markdown"]
       elsif /^(;;|\(define_)/.match(data)
-        Language["GCC machine description"]
+        Language["GCC Machine Description"]
+      else
+        Language["Markdown"]
       end
     end
 
@@ -258,7 +313,7 @@ module Linguist
     disambiguate ".mod" do |data|
       if data.include?('<!ENTITY ')
         Language["XML"]
-      elsif /MODULE\s\w+\s*;/i.match(data) || /^\s*END \w+;$/i.match(data)
+      elsif /^\s*MODULE [\w\.]+;/i.match(data) || /^\s*END [\w\.]+;/i.match(data)
         Language["Modula-2"]
       else
         [Language["Linux Kernel Module"], Language["AMPL"]]
@@ -267,9 +322,9 @@ module Linguist
 
     disambiguate ".ms" do |data|
       if /^[.'][a-z][a-z](\s|$)/i.match(data)
-        Language["Groff"]
-      elsif /(?<!\S)\.(include|globa?l)\s/.match(data) || /(?<!\/\*)(\A|\n)\s*\.[A-Za-z]/.match(data.gsub(/"([^\\"]|\\.)*"|'([^\\']|\\.)*'|\\\s*(?:--.*)?\n/, ""))
-        Language["GAS"]
+        Language["Roff"]
+      elsif /(?<!\S)\.(include|globa?l)\s/.match(data) || /(?<!\/\*)(\A|\n)\s*\.[A-Za-z][_A-Za-z0-9]*:/.match(data.gsub(/"([^\\"]|\\.)*"|'([^\\']|\\.)*'|\\\s*(?:--.*)?\n/, ""))
+        Language["Unix Assembly"]
       else
         Language["MAXScript"]
       end
@@ -277,7 +332,7 @@ module Linguist
 
     disambiguate ".n" do |data|
       if /^[.']/.match(data)
-        Language["Groff"]
+        Language["Roff"]
       elsif /^(module|namespace|using)\s/.match(data)
         Language["Nemerle"]
       end
@@ -306,33 +361,27 @@ module Linguist
     end
 
     disambiguate ".pl" do |data|
-      if /^[^#]+:-/.match(data)
+      if /^[^#]*:-/.match(data)
         Language["Prolog"]
-      elsif /use strict|use\s+v?5\./.match(data)
+      elsif Perl5Regex.match(data)
         Language["Perl"]
-      elsif /^(use v6|(my )?class|module)/.match(data)
-        Language["Perl6"]
+      elsif Perl6Regex.match(data)
+        Language["Perl 6"]
       end
     end
 
-    disambiguate ".pm", ".t" do |data|
-      if /use strict|use\s+v?5\./.match(data)
+    disambiguate ".pm" do |data|
+      if Perl5Regex.match(data)
         Language["Perl"]
-      elsif /^(use v6|(my )?class|module)/.match(data)
-        Language["Perl6"]
-      end
-    end
-
-    disambiguate ".pod" do |data|
-      if /^=\w+$/.match(data)
-        Language["Pod"]
-      else
-        Language["Perl"]
+      elsif Perl6Regex.match(data)
+        Language["Perl 6"]
+      elsif /^\s*\/\* XPM \*\//.match(data)
+        Language["XPM"]
       end
     end
 
     disambiguate ".pro" do |data|
-      if /^[^#]+:-/.match(data)
+      if /^[^\[#]+:-/.match(data)
         Language["Prolog"]
       elsif data.include?("last_client=")
         Language["INI"]
@@ -351,10 +400,18 @@ module Linguist
       end
     end
 
+    disambiguate ".q" do |data|
+      if /[A-Z.][\w.]*:{/i.match(data) || /(^|\n)\\(cd?|d|l|p|ts?) /.match(data)
+        Language["q"]
+      elsif /SELECT\s+[\w*,]+\s+FROM/i.match(data) || /(CREATE|ALTER|DROP)\s(DATABASE|SCHEMA|TABLE)/i.match(data)
+        Language["HiveQL"]
+      end
+    end
+
     disambiguate ".r" do |data|
       if /\bRebol\b/i.match(data)
         Language["Rebol"]
-      elsif data.include?("<-")
+      elsif /<-|^\s*#/.match(data)
         Language["R"]
       end
     end
@@ -363,7 +420,7 @@ module Linguist
       if /^\.!|^\.end lit(?:eral)?\b/i.match(data)
         Language["RUNOFF"]
       elsif /^\.\\" /.match(data)
-        Language["Groff"]
+        Language["Roff"]
       end
     end
 
@@ -414,10 +471,12 @@ module Linguist
     end
     
     disambiguate ".t" do |data|
-      if /^\s*%|^\s*var\s+\w+\s*:\s*\w+/.match(data)
+      if Perl5Regex.match(data)
+        Language["Perl"]
+      elsif Perl6Regex.match(data)
+        Language["Perl 6"]
+      elsif /^\s*%[ \t]+|^\s*var\s+\w+\s*:=\s*\w+/.match(data)
         Language["Turing"]
-      elsif /^\s*use\s+v6\s*;/.match(data)
-        Language["Perl6"]
       end
     end
     
@@ -430,7 +489,7 @@ module Linguist
     end
 
     disambiguate ".ts" do |data|
-      if data.include?("</TS>")
+      if /<TS\b/.match(data)
         Language["XML"]
       else
         Language["TypeScript"]
@@ -445,5 +504,32 @@ module Linguist
         Language["Scilab"]
       end
     end
+
+    disambiguate ".tsx" do |data|
+      if /^\s*(import.+(from\s+|require\()['"]react|\/\/\/\s*<reference\s)/.match(data)
+        Language["TypeScript"]
+      elsif /^\s*<\?xml\s+version/i.match(data)
+        Language["XML"]
+      end
+    end
+  
+    disambiguate ".w" do |data|
+      if (data.include?("&ANALYZE-SUSPEND _UIB-CODE-BLOCK _CUSTOM _DEFINITIONS"))
+        Language["OpenEdge ABL"]
+      elsif /^@(<|\w+\.)/.match(data)
+        Language["CWeb"]
+      end
+    end
+  
+    disambiguate ".x" do |data|
+      if /\b(program|version)\s+\w+\s*{|\bunion\s+\w+\s+switch\s*\(/.match(data)
+        Language["RPC"]
+      elsif /^%(end|ctor|hook|group)\b/.match(data)
+        Language["Logos"]
+      elsif /OUTPUT_ARCH\(|OUTPUT_FORMAT\(|SECTIONS/.match(data)
+        Language["Linker Script"]
+      end
+    end
+
   end
 end
